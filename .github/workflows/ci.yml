@@ -30,6 +30,24 @@ jobs:
       - name: Check lint and imports
         run: uv run ruff check .
 
+  ty:
+    name: Ty
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Check types
+        run: uv run ty check --output-format github
+
   test:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest

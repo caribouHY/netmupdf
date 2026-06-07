@@ -6,10 +6,33 @@ readme = "README.md"
 authors = [
     { name = "caribouHY", email = "59246671+caribouHY@users.noreply.github.com" }
 ]
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
+keywords = ["pdf", "markdown", "network", "manual", "pymupdf"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Documentation",
+    "Topic :: Text Processing :: Markup :: Markdown",
+    "Topic :: Utilities",
+]
 dependencies = [
     "pymupdf4llm>=1.27.2.3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/caribouHY/netmupdf"
+Repository = "https://github.com/caribouHY/netmupdf"
+Issues = "https://github.com/caribouHY/netmupdf/issues"
 
 [project.scripts]
 netmupdf = "netmupdf.cli:main"
@@ -22,7 +45,9 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.0.3",
     "ruff>=0.15.16",
+    "twine>=6.2.0",
     "tox-uv>=1.35.2",
+    "ty>=0.0.44",
 ]
 
 [tool.ruff.lint]
