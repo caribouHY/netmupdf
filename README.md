@@ -46,11 +46,17 @@ uv run netmupdf manuals\manual.pdf --out output\manual --force
 
 ### 後処理プロファイル
 
-`--profile`を省略すると、抽出本文を加工しない`generic`を使用します。
+`--profile`オプションで、機種別の後処理プロファイルを指定できます。
+
+- `fitelnet`: FITELnetコマンドリファレンス用 (F70コマンドリファレンス構成定義編/運用管理編で動作を確認しています。)
+- `srs`: SR-Sシリーズコマンドリファレンス用 (SR-S V14コマンドリファレンスで動作を確認しています。)
+- `generic`(default): 汎用的な後処理で、上記以外のPDFに適しています。
+
+実行例:
 
 ```powershell
-uv run netmupdf manuals\FITELnet\F70\pdf\manual.pdf --profile fitelnet
-uv run netmupdf manuals\Fujitsu\SR-S_V14\pdf\cmd.pdf --profile srs
+uv run netmupdf f70_cmd_ope_ref.pdf --profile fitelnet
+uv run netmupdf sr_s_cmd.pdf --profile srs
 ```
 
 ## 出力
