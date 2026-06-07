@@ -7,7 +7,6 @@ from .fitelnet import FitelnetProfile
 from .generic import GenericProfile
 from .srs import SrsProfile
 
-
 PROFILES: dict[str, ConversionProfile] = {
     "generic": GenericProfile(),
     "fitelnet": FitelnetProfile(),

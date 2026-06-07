@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run ruff check --fix . && uv run ruff format .",
-            "commandWindows": "pwsh -NoProfile -Command \"uv run ruff check --fix . && uv run ruff format .\"",
+            "command": "uv run ruff check --fix --select I . && uv run ruff format .",
+            "commandWindows": "pwsh -NoProfile -Command \"uv run ruff check --fix --select I . && uv run ruff format .\"",
             "timeout": 30,
             "statusMessage": "Formatting and fixing with Ruff"
           }

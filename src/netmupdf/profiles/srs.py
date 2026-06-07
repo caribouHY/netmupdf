@@ -11,7 +11,6 @@ from .common import (
     unknown_character_warning,
 )
 
-
 SECTION_LABELS = (
     "機能",
     "適用機種",

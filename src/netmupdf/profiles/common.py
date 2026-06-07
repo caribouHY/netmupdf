@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 
-
 KNOWN_CHARACTER_REPLACEMENTS = str.maketrans(
     {
         "\uf06d": "-",
