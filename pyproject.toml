@@ -1,0 +1,25 @@
+[project]
+name = "netmupdf"
+version = "0.1.0"
+description = "Convert network device PDF manuals to Markdown using PyMuPDF4LLM"
+readme = "README.md"
+authors = [
+    { name = "caribouHY", email = "59246671+caribouHY@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "pymupdf4llm>=1.27.2.3",
+]
+
+[project.scripts]
+netmupdf = "netmupdf.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.16",
+]

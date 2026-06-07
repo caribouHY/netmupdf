@@ -1,0 +1,81 @@
+"""Command-line interface."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from .core import ConversionError, convert_pdf
+from .profiles import PROFILE_NAMES
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=("PDFを指定したしおりレベルで分割し、AI向けMarkdownへ変換します。")
+    )
+    parser.add_argument("pdf", type=Path, help="入力PDF")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help="出力ディレクトリ（既定: <PDF名>_markdown）",
+    )
+    parser.add_argument(
+        "--level",
+        type=int,
+        default=2,
+        help="分割に使うしおりレベル（既定: 2）",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=PROFILE_NAMES,
+        default="generic",
+        help="後処理プロファイル（既定: generic）",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="空でない出力ディレクトリへの書き込みを許可します",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="ファイルを書き込まず分割予定を表示します",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = convert_pdf(
+            args.pdf,
+            args.out,
+            level=args.level,
+            force=args.force,
+            dry_run=args.dry_run,
+            profile=args.profile,
+        )
+    except ConversionError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return 1
+
+    if result.dry_run:
+        print(f"出力予定: {result.output_dir}")
+        for section in result.sections:
+            warning = f" / 警告: {len(section.warnings)}件" if section.warnings else ""
+            print(
+                f"{section.output_name}: "
+                f"PDF {section.start_page}-{section.end_page}ページ "
+                f"({section.display_title}{warning})"
+            )
+        print(
+            f"dry-run: {len(result.sections)}セクション、"
+            f"警告 {result.warning_count}件（ファイル未作成）"
+        )
+        return 0
+
+    print(f"完了: {len(result.sections)}セクション")
+    print(f"出力先: {result.output_dir}")
+    print(f"警告: {result.warning_count}件")
+    return 0
