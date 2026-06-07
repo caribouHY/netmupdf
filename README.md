@@ -85,6 +85,7 @@ manual_markdown/
 
 ```powershell
 uv run pytest
+uv run tox
 ```
 
 ## ビルド

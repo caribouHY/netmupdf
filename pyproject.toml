@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "caribouHY", email = "59246671+caribouHY@users.noreply.github.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "pymupdf4llm>=1.27.2.3",
 ]
@@ -22,7 +22,16 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.0.3",
     "ruff>=0.15.16",
+    "tox-uv>=1.35.2",
 ]
 
 [tool.ruff.lint]
 extend-select = ["I"]
+
+[tool.tox]
+env_list = ["3.12", "3.13", "3.14"]
+
+[tool.tox.env_run_base]
+description = "Run tests with Python {base_python}"
+deps = ["pytest>=9.0.3"]
+commands = [["pytest", { replace = "posargs", default = [], extend = true }]]
