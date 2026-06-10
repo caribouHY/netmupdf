@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import io
+from concurrent.futures import Future
 from pathlib import Path
 
 import pymupdf
@@ -9,13 +11,14 @@ import pytest
 from netmupdf import (
     Bookmark,
     ConversionError,
+    ConversionProgress,
     Section,
     build_sections,
     convert_pdf,
     safe_filename,
 )
 from netmupdf.cli import build_parser, main
-from netmupdf.core import _extract_section
+from netmupdf.core import _extract_chunks, _extract_section, _resolve_jobs
 from netmupdf.profiles.common import format_code_sections
 from netmupdf.profiles.fitelnet import FitelnetProfile
 from netmupdf.profiles.generic import GenericProfile
@@ -116,6 +119,88 @@ def test_dry_run_does_not_create_output(tmp_path: Path) -> None:
     assert not output.exists()
 
 
+def test_conversion_reports_progress_for_each_section(tmp_path: Path) -> None:
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two"],
+        [[1, "First", 1], [1, "Second", 2]],
+    )
+    events: list[ConversionProgress] = []
+
+    convert_pdf(source, tmp_path / "out", level=1, progress_callback=events.append)
+
+    assert [(event.completed, event.total) for event in events] == [
+        (0, 2),
+        (1, 2),
+        (2, 2),
+    ]
+    assert [
+        event.current_section.display_title if event.current_section else None
+        for event in events
+    ] == ["First", "Second", None]
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_conversion_reports_same_progress_in_serial_and_parallel(
+    tmp_path: Path, jobs: int
+) -> None:
+    source = make_pdf(
+        tmp_path / f"manual-{jobs}.pdf",
+        ["one", "two", "three"],
+        [[1, "First", 1], [1, "Second", 2], [1, "Third", 3]],
+    )
+    events: list[ConversionProgress] = []
+
+    convert_pdf(
+        source,
+        tmp_path / f"out-{jobs}",
+        level=1,
+        jobs=jobs,
+        progress_callback=events.append,
+    )
+
+    assert [(event.completed, event.total) for event in events] == [
+        (0, 3),
+        (1, 3),
+        (2, 3),
+        (3, 3),
+    ]
+    assert [
+        event.current_section.display_title if event.current_section else None
+        for event in events
+    ] == ["First", "Second", "Third", None]
+
+
+def test_dry_run_does_not_report_progress(tmp_path: Path) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    events: list[ConversionProgress] = []
+
+    convert_pdf(
+        source,
+        tmp_path / "out",
+        level=1,
+        dry_run=True,
+        progress_callback=events.append,
+    )
+
+    assert events == []
+
+
+def test_progress_callback_exception_is_propagated(tmp_path: Path) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+
+    def raise_from_callback(progress: ConversionProgress) -> None:
+        raise RuntimeError(f"progress: {progress.completed}")
+
+    with pytest.raises(RuntimeError, match="progress: 0"):
+        convert_pdf(
+            source,
+            tmp_path / "out",
+            level=1,
+            progress_callback=raise_from_callback,
+        )
+
+
 def test_nonempty_output_requires_force(tmp_path: Path) -> None:
     source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
     output = tmp_path / "out"
@@ -153,6 +238,42 @@ def test_cli_returns_nonzero_for_missing_pdf(
 
     assert exit_code == 1
     assert "エラー:" in capsys.readouterr().err
+
+
+def test_cli_reports_progress_as_lines_when_stderr_is_not_tty(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two"],
+        [[1, "First", 1], [1, "Second", 2]],
+    )
+
+    assert main([str(source), "--level", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert "[  0%] 0/2 変換中: First\n" in captured.err
+    assert "[ 50%] 1/2 変換中: Second\n" in captured.err
+    assert "[100%] 2/2 完了\n" in captured.err
+    assert "完了: 2セクション\n" in captured.out
+
+
+def test_cli_updates_one_line_when_stderr_is_tty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TtyBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    stderr = TtyBuffer()
+    monkeypatch.setattr("sys.stderr", stderr)
+
+    assert main([str(source), "--level", "1"]) == 0
+
+    assert stderr.getvalue().startswith("\r[  0%] 0/1 変換中: Chapter")
+    assert "\r[100%] 1/1 完了" in stderr.getvalue()
+    assert stderr.getvalue().endswith("\n")
 
 
 def test_safe_filename_handles_windows_characters_and_japanese() -> None:
@@ -472,3 +593,216 @@ def test_cli_profile_defaults_to_generic_and_rejects_unknown() -> None:
     assert parser.parse_args(["manual.pdf"]).profile == "generic"
     with pytest.raises(SystemExit):
         parser.parse_args(["manual.pdf", "--profile", "unknown"])
+
+
+def test_cli_legacy_defaults_to_false_and_accepts_flag() -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(["manual.pdf"]).legacy is False
+    assert parser.parse_args(["manual.pdf", "--legacy"]).legacy is True
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected_calls"),
+    [(False, [True, True]), (True, [False, True])],
+)
+def test_conversion_selects_extractor_and_restores_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy: bool,
+    expected_calls: list[bool],
+) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    calls: list[bool] = []
+    monkeypatch.setattr("netmupdf.core.pymupdf4llm.use_layout", calls.append)
+
+    convert_pdf(source, tmp_path / "out", level=1, jobs=1, legacy=legacy)
+
+    assert calls == expected_calls
+
+
+def test_legacy_extractor_omits_unsupported_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    document = pymupdf.open(source)
+    captured_options: list[dict[str, object]] = []
+
+    def fake_to_markdown(
+        _document: pymupdf.Document, **options: object
+    ) -> list[dict[str, str]]:
+        captured_options.append(options)
+        return [{"text": "text"}]
+
+    monkeypatch.setattr("netmupdf.core.pymupdf4llm.to_markdown", fake_to_markdown)
+    monkeypatch.setattr("netmupdf.core._legacy_extractor", True)
+
+    _extract_chunks(document, [0])
+    document.close()
+
+    assert captured_options == [{"pages": [0], "page_chunks": True}]
+
+
+def test_legacy_mode_restores_layout_after_callback_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    calls: list[bool] = []
+    monkeypatch.setattr("netmupdf.core.pymupdf4llm.use_layout", calls.append)
+
+    def fail_progress(_progress: ConversionProgress) -> None:
+        raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError, match="stop"):
+        convert_pdf(
+            source,
+            tmp_path / "out",
+            level=1,
+            jobs=1,
+            legacy=True,
+            progress_callback=fail_progress,
+        )
+
+    assert calls == [False, True]
+
+
+def test_legacy_mode_keeps_page_order_markers_and_progress(tmp_path: Path) -> None:
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two"],
+        [[1, "Chapter", 1]],
+    )
+    events: list[ConversionProgress] = []
+
+    convert_pdf(
+        source,
+        tmp_path / "out",
+        level=1,
+        jobs=1,
+        legacy=True,
+        progress_callback=events.append,
+    )
+
+    markdown = (tmp_path / "out" / "001_Chapter.md").read_text(encoding="utf-8")
+    assert markdown.index("<!-- PDF_PAGE: 1 -->") < markdown.index(
+        "<!-- PDF_PAGE: 2 -->"
+    )
+    assert [(event.completed, event.total) for event in events] == [(0, 1), (1, 1)]
+
+
+def test_serial_and_parallel_outputs_are_identical(tmp_path: Path) -> None:
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two", None, "four"],
+        [
+            [1, "First", 1],
+            [1, "Second", 2],
+            [1, "Empty", 3],
+            [1, "Fourth", 4],
+        ],
+    )
+    serial_output = tmp_path / "serial"
+    parallel_output = tmp_path / "parallel"
+
+    serial_result = convert_pdf(source, serial_output, level=1, jobs=1)
+    parallel_result = convert_pdf(source, parallel_output, level=1, jobs=2)
+
+    assert serial_result.warning_count == parallel_result.warning_count
+    assert [
+        (section.output_name, section.warnings) for section in serial_result.sections
+    ] == [
+        (section.output_name, section.warnings) for section in parallel_result.sections
+    ]
+    serial_files = {
+        path.name: path.read_bytes()
+        for path in serial_output.iterdir()
+        if path.is_file()
+    }
+    parallel_files = {
+        path.name: path.read_bytes()
+        for path in parallel_output.iterdir()
+        if path.is_file()
+    }
+    assert serial_files == parallel_files
+
+
+@pytest.mark.parametrize(
+    ("cpu_count", "section_count", "expected"),
+    [
+        (1, 10, 1),
+        (2, 10, 1),
+        (4, 10, 3),
+        (16, 10, 4),
+        (16, 2, 2),
+    ],
+)
+def test_resolve_jobs_uses_cpu_section_and_safety_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_count: int,
+    section_count: int,
+    expected: int,
+) -> None:
+    monkeypatch.setattr("netmupdf.core.os.cpu_count", lambda: cpu_count)
+
+    assert _resolve_jobs(None, section_count) == expected
+
+
+def test_explicit_jobs_is_limited_by_section_count() -> None:
+    assert _resolve_jobs(8, 3) == 3
+
+
+@pytest.mark.parametrize("jobs", [0, -1])
+def test_convert_pdf_rejects_nonpositive_jobs(tmp_path: Path, jobs: int) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+
+    with pytest.raises(ConversionError, match="--jobs"):
+        convert_pdf(source, tmp_path / "out", level=1, jobs=jobs)
+
+
+@pytest.mark.parametrize("jobs", ["0", "-1"])
+def test_cli_rejects_nonpositive_jobs(jobs: str) -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["manual.pdf", "--jobs", jobs])
+
+
+def test_parallel_worker_failure_falls_back_to_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailingExecutor:
+        def __init__(self, **kwargs: object) -> None:
+            initargs = kwargs["initargs"]
+            assert isinstance(initargs, tuple)
+            assert initargs[-1] is True
+            self.submissions = 0
+
+        def submit(self, *_args: object) -> Future[object]:
+            future: Future[object] = Future()
+            if self.submissions == 0:
+                future.set_exception(RuntimeError("worker failed"))
+            else:
+                future.set_exception(AssertionError("future should be cancelled"))
+            self.submissions += 1
+            return future
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait is True
+            assert cancel_futures is True
+
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two"],
+        [[1, "First", 1], [1, "Second", 2]],
+    )
+    serial_output = tmp_path / "serial"
+    serial_result = convert_pdf(source, serial_output, level=1, jobs=1, legacy=True)
+    monkeypatch.setattr("netmupdf.core.ProcessPoolExecutor", FailingExecutor)
+
+    fallback_output = tmp_path / "fallback"
+    result = convert_pdf(source, fallback_output, level=1, jobs=2, legacy=True)
+
+    assert result.warning_count == serial_result.warning_count
+    assert {path.name: path.read_bytes() for path in fallback_output.iterdir()} == {
+        path.name: path.read_bytes() for path in serial_output.iterdir()
+    }
