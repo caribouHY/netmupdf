@@ -71,6 +71,16 @@ uv run netmupdf manuals\manual.pdf --jobs 2
 `--jobs 1`を指定すると直列処理になります。並列数を増やすと変換が速くなる
 場合がありますが、CPUとメモリの使用量も増加します。
 
+速度を優先する場合は、PyMuPDF4LLMの旧Markdown抽出器を使用できます。
+
+```powershell
+uv run netmupdf manuals\manual.pdf --legacy
+```
+
+`--legacy`は`--jobs`と併用できます。現行のLayout解析より高速ですが、
+ヘッダーとフッターの除去、表、段組み、見出しなどのMarkdown構造は
+現行モードと異なる場合があります。
+
 ### 後処理プロファイル
 
 `--profile`オプションで、機種別の後処理プロファイルを指定できます。

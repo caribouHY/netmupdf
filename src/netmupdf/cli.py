@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="並列処理数（既定: CPU数に応じて自動、最大4）",
     )
     parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="速度を優先する旧Markdown抽出器を使用します",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="空でない出力ディレクトリへの書き込みを許可します",
@@ -98,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             profile=args.profile,
             jobs=args.jobs,
+            legacy=args.legacy,
             progress_callback=None if args.dry_run else progress_reporter,
         )
     except ConversionError as exc:

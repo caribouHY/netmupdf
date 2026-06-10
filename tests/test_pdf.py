@@ -18,7 +18,7 @@ from netmupdf import (
     safe_filename,
 )
 from netmupdf.cli import build_parser, main
-from netmupdf.core import _extract_section, _resolve_jobs
+from netmupdf.core import _extract_chunks, _extract_section, _resolve_jobs
 from netmupdf.profiles.common import format_code_sections
 from netmupdf.profiles.fitelnet import FitelnetProfile
 from netmupdf.profiles.generic import GenericProfile
@@ -595,6 +595,101 @@ def test_cli_profile_defaults_to_generic_and_rejects_unknown() -> None:
         parser.parse_args(["manual.pdf", "--profile", "unknown"])
 
 
+def test_cli_legacy_defaults_to_false_and_accepts_flag() -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(["manual.pdf"]).legacy is False
+    assert parser.parse_args(["manual.pdf", "--legacy"]).legacy is True
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected_calls"),
+    [(False, [True, True]), (True, [False, True])],
+)
+def test_conversion_selects_extractor_and_restores_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy: bool,
+    expected_calls: list[bool],
+) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    calls: list[bool] = []
+    monkeypatch.setattr("netmupdf.core.pymupdf4llm.use_layout", calls.append)
+
+    convert_pdf(source, tmp_path / "out", level=1, jobs=1, legacy=legacy)
+
+    assert calls == expected_calls
+
+
+def test_legacy_extractor_omits_unsupported_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    document = pymupdf.open(source)
+    captured_options: list[dict[str, object]] = []
+
+    def fake_to_markdown(
+        _document: pymupdf.Document, **options: object
+    ) -> list[dict[str, str]]:
+        captured_options.append(options)
+        return [{"text": "text"}]
+
+    monkeypatch.setattr("netmupdf.core.pymupdf4llm.to_markdown", fake_to_markdown)
+    monkeypatch.setattr("netmupdf.core._legacy_extractor", True)
+
+    _extract_chunks(document, [0])
+    document.close()
+
+    assert captured_options == [{"pages": [0], "page_chunks": True}]
+
+
+def test_legacy_mode_restores_layout_after_callback_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    calls: list[bool] = []
+    monkeypatch.setattr("netmupdf.core.pymupdf4llm.use_layout", calls.append)
+
+    def fail_progress(_progress: ConversionProgress) -> None:
+        raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError, match="stop"):
+        convert_pdf(
+            source,
+            tmp_path / "out",
+            level=1,
+            jobs=1,
+            legacy=True,
+            progress_callback=fail_progress,
+        )
+
+    assert calls == [False, True]
+
+
+def test_legacy_mode_keeps_page_order_markers_and_progress(tmp_path: Path) -> None:
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two"],
+        [[1, "Chapter", 1]],
+    )
+    events: list[ConversionProgress] = []
+
+    convert_pdf(
+        source,
+        tmp_path / "out",
+        level=1,
+        jobs=1,
+        legacy=True,
+        progress_callback=events.append,
+    )
+
+    markdown = (tmp_path / "out" / "001_Chapter.md").read_text(encoding="utf-8")
+    assert markdown.index("<!-- PDF_PAGE: 1 -->") < markdown.index(
+        "<!-- PDF_PAGE: 2 -->"
+    )
+    assert [(event.completed, event.total) for event in events] == [(0, 1), (1, 1)]
+
+
 def test_serial_and_parallel_outputs_are_identical(tmp_path: Path) -> None:
     source = make_pdf(
         tmp_path / "manual.pdf",
@@ -676,7 +771,10 @@ def test_parallel_worker_failure_falls_back_to_serial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class FailingExecutor:
-        def __init__(self, **_kwargs: object) -> None:
+        def __init__(self, **kwargs: object) -> None:
+            initargs = kwargs["initargs"]
+            assert isinstance(initargs, tuple)
+            assert initargs[-1] is True
             self.submissions = 0
 
         def submit(self, *_args: object) -> Future[object]:
@@ -698,11 +796,11 @@ def test_parallel_worker_failure_falls_back_to_serial(
         [[1, "First", 1], [1, "Second", 2]],
     )
     serial_output = tmp_path / "serial"
-    serial_result = convert_pdf(source, serial_output, level=1, jobs=1)
+    serial_result = convert_pdf(source, serial_output, level=1, jobs=1, legacy=True)
     monkeypatch.setattr("netmupdf.core.ProcessPoolExecutor", FailingExecutor)
 
     fallback_output = tmp_path / "fallback"
-    result = convert_pdf(source, fallback_output, level=1, jobs=2)
+    result = convert_pdf(source, fallback_output, level=1, jobs=2, legacy=True)
 
     assert result.warning_count == serial_result.warning_count
     assert {path.name: path.read_bytes() for path in fallback_output.iterdir()} == {

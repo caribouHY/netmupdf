@@ -7,8 +7,9 @@ import csv
 import json
 import os
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ProcessPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,6 +72,7 @@ class _SectionExtraction:
 
 
 _worker_document: pymupdf.Document | None = None
+_legacy_extractor = False
 
 
 def safe_filename(text: str, max_len: int = 100) -> str:
@@ -178,14 +180,19 @@ def _heading_lines(hierarchies: list[tuple[str, ...]]) -> list[str]:
 
 
 def _extract_chunks(document: pymupdf.Document, page_indexes: list[int]) -> list[dict]:
-    result = pymupdf4llm.to_markdown(
-        document,
-        pages=page_indexes,
-        page_chunks=True,
-        header=False,
-        footer=False,
-        use_ocr=False,
-    )
+    options: dict[str, object] = {
+        "pages": page_indexes,
+        "page_chunks": True,
+    }
+    if not _legacy_extractor:
+        options.update(
+            {
+                "header": False,
+                "footer": False,
+                "use_ocr": False,
+            }
+        )
+    result = pymupdf4llm.to_markdown(document, **options)
     if not isinstance(result, list):
         raise RuntimeError("PyMuPDF4LLM returned an unexpected result")
     return result
@@ -317,8 +324,24 @@ def _close_worker_document() -> None:
         _worker_document = None
 
 
-def _initialize_worker(input_path: str) -> None:
+def _set_legacy_extractor(enabled: bool) -> None:
+    global _legacy_extractor
+    pymupdf4llm.use_layout(not enabled)
+    _legacy_extractor = enabled
+
+
+@contextmanager
+def _extraction_mode(legacy: bool) -> Iterator[None]:
+    _set_legacy_extractor(legacy)
+    try:
+        yield
+    finally:
+        _set_legacy_extractor(False)
+
+
+def _initialize_worker(input_path: str, legacy: bool) -> None:
     global _worker_document
+    _set_legacy_extractor(legacy)
     _worker_document = pymupdf.open(input_path)
     atexit.register(_close_worker_document)
 
@@ -404,6 +427,7 @@ def _convert_sections_parallel(
     output_dir: Path,
     source_name: str,
     profile: ConversionProfile,
+    legacy: bool,
     progress_callback: Callable[[ConversionProgress], None] | None,
 ) -> None:
     executor: ProcessPoolExecutor | None = None
@@ -414,7 +438,7 @@ def _convert_sections_parallel(
             executor = ProcessPoolExecutor(
                 max_workers=jobs,
                 initializer=_initialize_worker,
-                initargs=(str(input_path),),
+                initargs=(str(input_path), legacy),
             )
             for section_index, section in enumerate(sections):
                 pending[section_index] = executor.submit(
@@ -547,6 +571,7 @@ def convert_pdf(
     dry_run: bool = False,
     profile: str = "generic",
     jobs: int | None = None,
+    legacy: bool = False,
     progress_callback: Callable[[ConversionProgress], None] | None = None,
 ) -> ConversionResult:
     """Convert one bookmarked PDF into sectioned Markdown files."""
@@ -603,36 +628,38 @@ def convert_pdf(
                 dry_run=True,
             )
 
-        _prepare_output(output_dir, force)
-        _report_progress(sections, 0, progress_callback)
-        if worker_count == 1:
-            _convert_sections_serial(
-                document,
-                sections,
-                0,
-                output_dir,
-                input_path.name,
-                selected_profile,
-                progress_callback,
+        with _extraction_mode(legacy):
+            _prepare_output(output_dir, force)
+            _report_progress(sections, 0, progress_callback)
+            if worker_count == 1:
+                _convert_sections_serial(
+                    document,
+                    sections,
+                    0,
+                    output_dir,
+                    input_path.name,
+                    selected_profile,
+                    progress_callback,
+                )
+            else:
+                _convert_sections_parallel(
+                    document,
+                    input_path,
+                    sections,
+                    worker_count,
+                    output_dir,
+                    input_path.name,
+                    selected_profile,
+                    legacy,
+                    progress_callback,
+                )
+            _write_index(output_dir, input_path.name, sections)
+            _write_csv(output_dir, sections)
+            return ConversionResult(
+                sections=sections,
+                warning_count=sum(len(section.warnings) for section in sections),
+                output_dir=output_dir,
+                dry_run=False,
             )
-        else:
-            _convert_sections_parallel(
-                document,
-                input_path,
-                sections,
-                worker_count,
-                output_dir,
-                input_path.name,
-                selected_profile,
-                progress_callback,
-            )
-        _write_index(output_dir, input_path.name, sections)
-        _write_csv(output_dir, sections)
-        return ConversionResult(
-            sections=sections,
-            warning_count=sum(len(section.warnings) for section in sections),
-            output_dir=output_dir,
-            dry_run=False,
-        )
     finally:
         document.close()
