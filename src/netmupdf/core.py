@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import atexit
 import csv
 import json
+import os
 import re
 from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -58,6 +61,16 @@ class ConversionProgress:
     completed: int
     total: int
     current_section: Section | None
+
+
+@dataclass(frozen=True)
+class _SectionExtraction:
+    raw_texts: list[str]
+    source_had_text: list[bool]
+    warnings: list[str]
+
+
+_worker_document: pymupdf.Document | None = None
 
 
 def safe_filename(text: str, max_len: int = 100) -> str:
@@ -208,14 +221,44 @@ def _extract_section_chunks(document: pymupdf.Document, section: Section) -> lis
         return chunks
 
 
-def _extract_section(
+def _extract_section_data(
     document: pymupdf.Document,
     section: Section,
+) -> _SectionExtraction:
+    chunks = _extract_section_chunks(document, section)
+    raw_texts: list[str] = []
+    source_had_text: list[bool] = []
+    for offset, chunk in enumerate(chunks):
+        page_number = section.start_page + offset
+        raw_text = str(chunk.get("text", ""))
+        page_had_text = bool(raw_text.strip())
+        if not raw_text.strip():
+            fallback_text = document.load_page(page_number - 1).get_text(
+                "text", sort=True
+            )
+            if fallback_text.strip():
+                raw_text = fallback_text
+                page_had_text = True
+                section.warnings.append(
+                    f"ページ {page_number}: PyMuPDF4LLMの抽出結果が空のため"
+                    "標準テキスト抽出を使用しました"
+                )
+        raw_texts.append(raw_text)
+        source_had_text.append(page_had_text)
+
+    return _SectionExtraction(
+        raw_texts=raw_texts,
+        source_had_text=source_had_text,
+        warnings=list(section.warnings),
+    )
+
+
+def _render_section(
+    section: Section,
     source_name: str,
-    profile: ConversionProfile | str = "generic",
+    profile: ConversionProfile,
+    extraction: _SectionExtraction,
 ) -> str:
-    if isinstance(profile, str):
-        profile = get_profile(profile)
     quoted_source = json.dumps(source_name, ensure_ascii=False)
     lines = [
         "---",
@@ -226,25 +269,11 @@ def _extract_section(
         "",
         *_heading_lines(section.titles),
     ]
-
-    chunks = _extract_section_chunks(document, section)
     content_lines: list[str] = []
-    for offset, chunk in enumerate(chunks):
+    for offset, (raw_text, page_had_text) in enumerate(
+        zip(extraction.raw_texts, extraction.source_had_text, strict=True)
+    ):
         page_number = section.start_page + offset
-        raw_text = str(chunk.get("text", ""))
-        source_had_text = bool(raw_text.strip())
-        if not raw_text.strip():
-            fallback_text = document.load_page(page_number - 1).get_text(
-                "text", sort=True
-            )
-            if fallback_text.strip():
-                raw_text = fallback_text
-                source_had_text = True
-                section.warnings.append(
-                    f"ページ {page_number}: PyMuPDF4LLMの抽出結果が空のため"
-                    "標準テキスト抽出を使用しました"
-                )
-
         text, warning = profile.process_page(
             raw_text,
             page_number,
@@ -256,7 +285,7 @@ def _extract_section(
             section.warnings.append(warning)
         if text:
             content_lines.extend([text, ""])
-        elif not source_had_text:
+        elif not page_had_text:
             empty_warning = f"ページ {page_number}: テキストを抽出できませんでした"
             if not any(
                 item.startswith(f"ページ {page_number}: Markdown抽出に失敗")
@@ -267,6 +296,169 @@ def _extract_section(
 
     lines.extend([profile.process_section("\n".join(content_lines)), ""])
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _extract_section(
+    document: pymupdf.Document,
+    section: Section,
+    source_name: str,
+    profile: ConversionProfile | str = "generic",
+) -> str:
+    if isinstance(profile, str):
+        profile = get_profile(profile)
+    extraction = _extract_section_data(document, section)
+    return _render_section(section, source_name, profile, extraction)
+
+
+def _close_worker_document() -> None:
+    global _worker_document
+    if _worker_document is not None:
+        _worker_document.close()
+        _worker_document = None
+
+
+def _initialize_worker(input_path: str) -> None:
+    global _worker_document
+    _worker_document = pymupdf.open(input_path)
+    atexit.register(_close_worker_document)
+
+
+def _extract_section_worker(section: Section) -> _SectionExtraction:
+    if _worker_document is None:
+        raise RuntimeError("PDF worker was not initialized")
+    return _extract_section_data(_worker_document, section)
+
+
+def _resolve_jobs(jobs: int | None, section_count: int) -> int:
+    if jobs is not None:
+        if jobs < 1:
+            raise ConversionError("--jobs は1以上を指定してください。")
+        return min(jobs, max(section_count, 1))
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(4, cpu_count - 1, section_count))
+
+
+def _write_section(
+    output_dir: Path,
+    source_name: str,
+    section: Section,
+    profile: ConversionProfile,
+    extraction: _SectionExtraction,
+) -> None:
+    section.warnings.extend(extraction.warnings)
+    markdown = _render_section(section, source_name, profile, extraction)
+    (output_dir / section.output_name).write_text(markdown, encoding="utf-8")
+
+
+def _copy_section_for_extraction(section: Section) -> Section:
+    return Section(
+        index=section.index,
+        titles=section.titles,
+        start_page=section.start_page,
+        end_page=section.end_page,
+        output_name=section.output_name,
+    )
+
+
+def _report_progress(
+    sections: list[Section],
+    completed: int,
+    progress_callback: Callable[[ConversionProgress], None] | None,
+) -> None:
+    if progress_callback is None:
+        return
+    current_section = sections[completed] if completed < len(sections) else None
+    progress_callback(
+        ConversionProgress(
+            completed=completed,
+            total=len(sections),
+            current_section=current_section,
+        )
+    )
+
+
+def _convert_sections_serial(
+    document: pymupdf.Document,
+    sections: list[Section],
+    start_index: int,
+    output_dir: Path,
+    source_name: str,
+    profile: ConversionProfile,
+    progress_callback: Callable[[ConversionProgress], None] | None,
+) -> None:
+    for section_index in range(start_index, len(sections)):
+        section = sections[section_index]
+        extraction = _extract_section_data(
+            document, _copy_section_for_extraction(section)
+        )
+        _write_section(output_dir, source_name, section, profile, extraction)
+        _report_progress(sections, section_index + 1, progress_callback)
+
+
+def _convert_sections_parallel(
+    document: pymupdf.Document,
+    input_path: Path,
+    sections: list[Section],
+    jobs: int,
+    output_dir: Path,
+    source_name: str,
+    profile: ConversionProfile,
+    progress_callback: Callable[[ConversionProgress], None] | None,
+) -> None:
+    executor: ProcessPoolExecutor | None = None
+    pending: dict[int, Future[_SectionExtraction]] = {}
+    next_to_write = 0
+    try:
+        try:
+            executor = ProcessPoolExecutor(
+                max_workers=jobs,
+                initializer=_initialize_worker,
+                initargs=(str(input_path),),
+            )
+            for section_index, section in enumerate(sections):
+                pending[section_index] = executor.submit(
+                    _extract_section_worker,
+                    _copy_section_for_extraction(section),
+                )
+        except Exception:
+            for future in pending.values():
+                future.cancel()
+            _convert_sections_serial(
+                document,
+                sections,
+                next_to_write,
+                output_dir,
+                source_name,
+                profile,
+                progress_callback,
+            )
+            return
+
+        while next_to_write < len(sections):
+            try:
+                extraction = pending.pop(next_to_write).result()
+            except Exception:
+                for future in pending.values():
+                    future.cancel()
+                _convert_sections_serial(
+                    document,
+                    sections,
+                    next_to_write,
+                    output_dir,
+                    source_name,
+                    profile,
+                    progress_callback,
+                )
+                return
+
+            section = sections[next_to_write]
+            _write_section(output_dir, source_name, section, profile, extraction)
+            next_to_write += 1
+            _report_progress(sections, next_to_write, progress_callback)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _inspect_empty_pages(document: pymupdf.Document, sections: list[Section]) -> None:
@@ -354,6 +546,7 @@ def convert_pdf(
     force: bool = False,
     dry_run: bool = False,
     profile: str = "generic",
+    jobs: int | None = None,
     progress_callback: Callable[[ConversionProgress], None] | None = None,
 ) -> ConversionResult:
     """Convert one bookmarked PDF into sectioned Markdown files."""
@@ -364,6 +557,8 @@ def convert_pdf(
         raise ConversionError(f"入力ファイルはPDFではありません: {input_path}")
     if level < 1:
         raise ConversionError("--level は1以上を指定してください。")
+    if jobs is not None and jobs < 1:
+        raise ConversionError("--jobs は1以上を指定してください。")
     try:
         selected_profile = get_profile(profile)
     except ValueError as exc:
@@ -397,6 +592,7 @@ def convert_pdf(
                 f"利用可能なレベル: {available_levels}"
             )
         sections = build_sections(bookmarks, document.page_count, level)
+        worker_count = _resolve_jobs(jobs, len(sections))
 
         if dry_run:
             _inspect_empty_pages(document, sections)
@@ -408,30 +604,28 @@ def convert_pdf(
             )
 
         _prepare_output(output_dir, force)
-        if progress_callback is not None:
-            progress_callback(
-                ConversionProgress(
-                    completed=0,
-                    total=len(sections),
-                    current_section=sections[0],
-                )
+        _report_progress(sections, 0, progress_callback)
+        if worker_count == 1:
+            _convert_sections_serial(
+                document,
+                sections,
+                0,
+                output_dir,
+                input_path.name,
+                selected_profile,
+                progress_callback,
             )
-        for completed, section in enumerate(sections, start=1):
-            markdown = _extract_section(
-                document, section, input_path.name, selected_profile
+        else:
+            _convert_sections_parallel(
+                document,
+                input_path,
+                sections,
+                worker_count,
+                output_dir,
+                input_path.name,
+                selected_profile,
+                progress_callback,
             )
-            (output_dir / section.output_name).write_text(markdown, encoding="utf-8")
-            if progress_callback is not None:
-                current_section = (
-                    sections[completed] if completed < len(sections) else None
-                )
-                progress_callback(
-                    ConversionProgress(
-                        completed=completed,
-                        total=len(sections),
-                        current_section=current_section,
-                    )
-                )
         _write_index(output_dir, input_path.name, sections)
         _write_csv(output_dir, sections)
         return ConversionResult(

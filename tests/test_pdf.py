@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+from concurrent.futures import Future
 from pathlib import Path
 
 import pymupdf
@@ -17,7 +18,7 @@ from netmupdf import (
     safe_filename,
 )
 from netmupdf.cli import build_parser, main
-from netmupdf.core import _extract_section
+from netmupdf.core import _extract_section, _resolve_jobs
 from netmupdf.profiles.common import format_code_sections
 from netmupdf.profiles.fitelnet import FitelnetProfile
 from netmupdf.profiles.generic import GenericProfile
@@ -137,6 +138,37 @@ def test_conversion_reports_progress_for_each_section(tmp_path: Path) -> None:
         event.current_section.display_title if event.current_section else None
         for event in events
     ] == ["First", "Second", None]
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_conversion_reports_same_progress_in_serial_and_parallel(
+    tmp_path: Path, jobs: int
+) -> None:
+    source = make_pdf(
+        tmp_path / f"manual-{jobs}.pdf",
+        ["one", "two", "three"],
+        [[1, "First", 1], [1, "Second", 2], [1, "Third", 3]],
+    )
+    events: list[ConversionProgress] = []
+
+    convert_pdf(
+        source,
+        tmp_path / f"out-{jobs}",
+        level=1,
+        jobs=jobs,
+        progress_callback=events.append,
+    )
+
+    assert [(event.completed, event.total) for event in events] == [
+        (0, 3),
+        (1, 3),
+        (2, 3),
+        (3, 3),
+    ]
+    assert [
+        event.current_section.display_title if event.current_section else None
+        for event in events
+    ] == ["First", "Second", "Third", None]
 
 
 def test_dry_run_does_not_report_progress(tmp_path: Path) -> None:
@@ -561,3 +593,118 @@ def test_cli_profile_defaults_to_generic_and_rejects_unknown() -> None:
     assert parser.parse_args(["manual.pdf"]).profile == "generic"
     with pytest.raises(SystemExit):
         parser.parse_args(["manual.pdf", "--profile", "unknown"])
+
+
+def test_serial_and_parallel_outputs_are_identical(tmp_path: Path) -> None:
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two", None, "four"],
+        [
+            [1, "First", 1],
+            [1, "Second", 2],
+            [1, "Empty", 3],
+            [1, "Fourth", 4],
+        ],
+    )
+    serial_output = tmp_path / "serial"
+    parallel_output = tmp_path / "parallel"
+
+    serial_result = convert_pdf(source, serial_output, level=1, jobs=1)
+    parallel_result = convert_pdf(source, parallel_output, level=1, jobs=2)
+
+    assert serial_result.warning_count == parallel_result.warning_count
+    assert [
+        (section.output_name, section.warnings) for section in serial_result.sections
+    ] == [
+        (section.output_name, section.warnings) for section in parallel_result.sections
+    ]
+    serial_files = {
+        path.name: path.read_bytes()
+        for path in serial_output.iterdir()
+        if path.is_file()
+    }
+    parallel_files = {
+        path.name: path.read_bytes()
+        for path in parallel_output.iterdir()
+        if path.is_file()
+    }
+    assert serial_files == parallel_files
+
+
+@pytest.mark.parametrize(
+    ("cpu_count", "section_count", "expected"),
+    [
+        (1, 10, 1),
+        (2, 10, 1),
+        (4, 10, 3),
+        (16, 10, 4),
+        (16, 2, 2),
+    ],
+)
+def test_resolve_jobs_uses_cpu_section_and_safety_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_count: int,
+    section_count: int,
+    expected: int,
+) -> None:
+    monkeypatch.setattr("netmupdf.core.os.cpu_count", lambda: cpu_count)
+
+    assert _resolve_jobs(None, section_count) == expected
+
+
+def test_explicit_jobs_is_limited_by_section_count() -> None:
+    assert _resolve_jobs(8, 3) == 3
+
+
+@pytest.mark.parametrize("jobs", [0, -1])
+def test_convert_pdf_rejects_nonpositive_jobs(tmp_path: Path, jobs: int) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+
+    with pytest.raises(ConversionError, match="--jobs"):
+        convert_pdf(source, tmp_path / "out", level=1, jobs=jobs)
+
+
+@pytest.mark.parametrize("jobs", ["0", "-1"])
+def test_cli_rejects_nonpositive_jobs(jobs: str) -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["manual.pdf", "--jobs", jobs])
+
+
+def test_parallel_worker_failure_falls_back_to_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailingExecutor:
+        def __init__(self, **_kwargs: object) -> None:
+            self.submissions = 0
+
+        def submit(self, *_args: object) -> Future[object]:
+            future: Future[object] = Future()
+            if self.submissions == 0:
+                future.set_exception(RuntimeError("worker failed"))
+            else:
+                future.set_exception(AssertionError("future should be cancelled"))
+            self.submissions += 1
+            return future
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait is True
+            assert cancel_futures is True
+
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two"],
+        [[1, "First", 1], [1, "Second", 2]],
+    )
+    serial_output = tmp_path / "serial"
+    serial_result = convert_pdf(source, serial_output, level=1, jobs=1)
+    monkeypatch.setattr("netmupdf.core.ProcessPoolExecutor", FailingExecutor)
+
+    fallback_output = tmp_path / "fallback"
+    result = convert_pdf(source, fallback_output, level=1, jobs=2)
+
+    assert result.warning_count == serial_result.warning_count
+    assert {path.name: path.read_bytes() for path in fallback_output.iterdir()} == {
+        path.name: path.read_bytes() for path in serial_output.iterdir()
+    }

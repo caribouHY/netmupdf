@@ -11,6 +11,13 @@ from .core import ConversionError, ConversionProgress, convert_pdf
 from .profiles import PROFILE_NAMES
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("1以上を指定してください")
+    return parsed
+
+
 class _ProgressReporter:
     def __init__(self, stream: TextIO) -> None:
         self.stream = stream
@@ -62,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="後処理プロファイル（既定: generic）",
     )
     parser.add_argument(
+        "--jobs",
+        type=_positive_int,
+        help="並列処理数（既定: CPU数に応じて自動、最大4）",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="空でない出力ディレクトリへの書き込みを許可します",
@@ -85,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force,
             dry_run=args.dry_run,
             profile=args.profile,
+            jobs=args.jobs,
             progress_callback=None if args.dry_run else progress_reporter,
         )
     except ConversionError as exc:

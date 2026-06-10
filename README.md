@@ -60,6 +60,17 @@ uv run netmupdf manuals\manual.pdf --out output\manual --force
 [100%] 3/3 完了
 ```
 
+変換処理はCPU数に応じて自動的に並列化されます。並列数は最大4で、
+セクション数を超えることはありません。並列数を明示する場合は
+`--jobs`を指定します。
+
+```powershell
+uv run netmupdf manuals\manual.pdf --jobs 2
+```
+
+`--jobs 1`を指定すると直列処理になります。並列数を増やすと変換が速くなる
+場合がありますが、CPUとメモリの使用量も増加します。
+
 ### 後処理プロファイル
 
 `--profile`オプションで、機種別の後処理プロファイルを指定できます。
