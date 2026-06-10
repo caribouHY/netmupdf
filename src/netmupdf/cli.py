@@ -5,9 +5,38 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import TextIO
 
-from .core import ConversionError, convert_pdf
+from .core import ConversionError, ConversionProgress, convert_pdf
 from .profiles import PROFILE_NAMES
+
+
+class _ProgressReporter:
+    def __init__(self, stream: TextIO) -> None:
+        self.stream = stream
+        self.is_tty = stream.isatty()
+        self.previous_width = 0
+
+    def __call__(self, progress: ConversionProgress) -> None:
+        percentage = (
+            round(progress.completed / progress.total * 100) if progress.total else 100
+        )
+        if progress.current_section is None:
+            status = "完了"
+        else:
+            status = f"変換中: {progress.current_section.display_title}"
+        message = f"[{percentage:3d}%] {progress.completed}/{progress.total} {status}"
+
+        if self.is_tty:
+            padded_message = message.ljust(self.previous_width)
+            self.stream.write(f"\r{padded_message}")
+            self.stream.flush()
+            self.previous_width = len(message)
+            if progress.current_section is None:
+                self.stream.write("\n")
+                self.stream.flush()
+        else:
+            print(message, file=self.stream, flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    progress_reporter = _ProgressReporter(sys.stderr)
     try:
         result = convert_pdf(
             args.pdf,
@@ -55,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force,
             dry_run=args.dry_run,
             profile=args.profile,
+            progress_callback=None if args.dry_run else progress_reporter,
         )
     except ConversionError as exc:
         print(f"エラー: {exc}", file=sys.stderr)

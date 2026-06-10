@@ -3,6 +3,7 @@
 from .core import (
     Bookmark,
     ConversionError,
+    ConversionProgress,
     ConversionResult,
     Section,
     build_sections,
@@ -14,6 +15,7 @@ from .core import (
 __all__ = [
     "Bookmark",
     "ConversionError",
+    "ConversionProgress",
     "ConversionResult",
     "Section",
     "build_sections",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 from pathlib import Path
 
 import pymupdf
@@ -9,6 +10,7 @@ import pytest
 from netmupdf import (
     Bookmark,
     ConversionError,
+    ConversionProgress,
     Section,
     build_sections,
     convert_pdf,
@@ -116,6 +118,57 @@ def test_dry_run_does_not_create_output(tmp_path: Path) -> None:
     assert not output.exists()
 
 
+def test_conversion_reports_progress_for_each_section(tmp_path: Path) -> None:
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two"],
+        [[1, "First", 1], [1, "Second", 2]],
+    )
+    events: list[ConversionProgress] = []
+
+    convert_pdf(source, tmp_path / "out", level=1, progress_callback=events.append)
+
+    assert [(event.completed, event.total) for event in events] == [
+        (0, 2),
+        (1, 2),
+        (2, 2),
+    ]
+    assert [
+        event.current_section.display_title if event.current_section else None
+        for event in events
+    ] == ["First", "Second", None]
+
+
+def test_dry_run_does_not_report_progress(tmp_path: Path) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    events: list[ConversionProgress] = []
+
+    convert_pdf(
+        source,
+        tmp_path / "out",
+        level=1,
+        dry_run=True,
+        progress_callback=events.append,
+    )
+
+    assert events == []
+
+
+def test_progress_callback_exception_is_propagated(tmp_path: Path) -> None:
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+
+    def raise_from_callback(progress: ConversionProgress) -> None:
+        raise RuntimeError(f"progress: {progress.completed}")
+
+    with pytest.raises(RuntimeError, match="progress: 0"):
+        convert_pdf(
+            source,
+            tmp_path / "out",
+            level=1,
+            progress_callback=raise_from_callback,
+        )
+
+
 def test_nonempty_output_requires_force(tmp_path: Path) -> None:
     source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
     output = tmp_path / "out"
@@ -153,6 +206,42 @@ def test_cli_returns_nonzero_for_missing_pdf(
 
     assert exit_code == 1
     assert "エラー:" in capsys.readouterr().err
+
+
+def test_cli_reports_progress_as_lines_when_stderr_is_not_tty(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = make_pdf(
+        tmp_path / "manual.pdf",
+        ["one", "two"],
+        [[1, "First", 1], [1, "Second", 2]],
+    )
+
+    assert main([str(source), "--level", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert "[  0%] 0/2 変換中: First\n" in captured.err
+    assert "[ 50%] 1/2 変換中: Second\n" in captured.err
+    assert "[100%] 2/2 完了\n" in captured.err
+    assert "完了: 2セクション\n" in captured.out
+
+
+def test_cli_updates_one_line_when_stderr_is_tty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TtyBuffer(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    source = make_pdf(tmp_path / "manual.pdf", ["text"], [[1, "Chapter", 1]])
+    stderr = TtyBuffer()
+    monkeypatch.setattr("sys.stderr", stderr)
+
+    assert main([str(source), "--level", "1"]) == 0
+
+    assert stderr.getvalue().startswith("\r[  0%] 0/1 変換中: Chapter")
+    assert "\r[100%] 1/1 完了" in stderr.getvalue()
+    assert stderr.getvalue().endswith("\n")
 
 
 def test_safe_filename_handles_windows_characters_and_japanese() -> None:

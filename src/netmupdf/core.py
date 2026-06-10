@@ -5,9 +5,9 @@ from __future__ import annotations
 import csv
 import json
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 import pymupdf
 import pymupdf4llm
@@ -51,6 +51,13 @@ class ConversionResult:
     warning_count: int
     output_dir: Path
     dry_run: bool
+
+
+@dataclass(frozen=True)
+class ConversionProgress:
+    completed: int
+    total: int
+    current_section: Section | None
 
 
 def safe_filename(text: str, max_len: int = 100) -> str:
@@ -347,6 +354,7 @@ def convert_pdf(
     force: bool = False,
     dry_run: bool = False,
     profile: str = "generic",
+    progress_callback: Callable[[ConversionProgress], None] | None = None,
 ) -> ConversionResult:
     """Convert one bookmarked PDF into sectioned Markdown files."""
     input_path = input_path.expanduser().resolve()
@@ -400,11 +408,30 @@ def convert_pdf(
             )
 
         _prepare_output(output_dir, force)
-        for section in sections:
+        if progress_callback is not None:
+            progress_callback(
+                ConversionProgress(
+                    completed=0,
+                    total=len(sections),
+                    current_section=sections[0],
+                )
+            )
+        for completed, section in enumerate(sections, start=1):
             markdown = _extract_section(
                 document, section, input_path.name, selected_profile
             )
             (output_dir / section.output_name).write_text(markdown, encoding="utf-8")
+            if progress_callback is not None:
+                current_section = (
+                    sections[completed] if completed < len(sections) else None
+                )
+                progress_callback(
+                    ConversionProgress(
+                        completed=completed,
+                        total=len(sections),
+                        current_section=current_section,
+                    )
+                )
         _write_index(output_dir, input_path.name, sections)
         _write_csv(output_dir, sections)
         return ConversionResult(

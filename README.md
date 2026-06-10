@@ -51,6 +51,15 @@ uv run netmupdf manuals\manual.pdf --level 2 --dry-run
 uv run netmupdf manuals\manual.pdf --out output\manual --force
 ```
 
+変換中はセクション単位の進捗が表示されます。
+
+```text
+[  0%] 0/3 変換中: Part One / Introduction
+[ 33%] 1/3 変換中: Part One / Configuration
+[ 67%] 2/3 変換中: Appendix / Commands
+[100%] 3/3 完了
+```
+
 ### 後処理プロファイル
 
 `--profile`オプションで、機種別の後処理プロファイルを指定できます。
